@@ -28,6 +28,14 @@ func NewServer(hub *hub.Hub) *Server {
 }
 
 func (s *Server) SetupRoutes() {
+	// Serve static files (CSS, JS)
+	s.echo.GET("/styles.css", func(c echo.Context) error {
+		return c.File("styles.css")
+	})
+	s.echo.GET("/app.js", func(c echo.Context) error {
+		return c.File("app.js")
+	})
+
 	s.echo.GET("/ws", func(c echo.Context) error {
 		return HandleWebSocket(s.hub, c)
 	})
