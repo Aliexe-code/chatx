@@ -5,6 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>WebSocket Chat</title>
     <link rel="stylesheet" href="styles.css">
+    <script src="https://unpkg.com/htmx.org@1.9.10"></script>
+    <script src="https://unpkg.com/htmx.org@1.9.10/dist/ext/ws.js"></script>
 </head>
 <body>
     <div class="container">
@@ -33,7 +35,7 @@
                 <div id="messages" class="messages"></div>
 
                 <div class="input-group">
-                    <input type="text" id="messageInput" placeholder="Type your message..." disabled>
+                    <input type="text" id="messageInput" name="message" placeholder="Type your message..." disabled>
                     <button id="sendButton" disabled>Send</button>
                     <button id="connectButton">Connect</button>
                 </div>
@@ -71,10 +73,9 @@
                 </div>
             </div>
             <div class="modal-footer">
-                <button class="btn-secondary" id="cancelCreateRoom">Cancel</button>
-                <button class="btn-primary" id="confirmCreateRoom">Create</button>
-            </div>
-        </div>
+                                <button class="btn-secondary" id="cancelCreateRoom">Cancel</button>
+                                <button class="btn-primary" id="confirmCreateRoom">Create</button>
+                            </div>        </div>
     </div>
 
     <!-- Join Room Modal -->
@@ -95,10 +96,9 @@
                 </div>
             </div>
             <div class="modal-footer">
-                <button class="btn-secondary" id="cancelJoinRoom">Cancel</button>
-                <button class="btn-primary" id="confirmJoinRoom">Join</button>
-            </div>
-        </div>
+                                <button class="btn-secondary" id="cancelJoinRoom">Cancel</button>
+                                <button class="btn-primary" id="confirmJoinRoom">Join</button>
+                            </div>        </div>
     </div>
 
     <!-- Delete Room Modal -->
@@ -113,12 +113,383 @@
                 <p style="color: #f39c12; font-size: 14px; margin-top: 10px;">All members will be moved to the default room.</p>
             </div>
             <div class="modal-footer">
-                <button class="btn-secondary" id="cancelDeleteRoom">Cancel</button>
-                <button class="btn-danger" id="confirmDeleteRoom">Delete</button>
-            </div>
-        </div>
+                                <button class="btn-secondary" id="cancelDeleteRoom">Cancel</button>
+                                <button class="btn-danger" id="confirmDeleteRoom">Delete</button>
+                            </div>        </div>
     </div>
 
-    <script src="app.js"></script>
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            let ws = null;
+            let currentRoom = "default";
+            const messageInput = document.getElementById('messageInput');
+            const sendButton = document.getElementById('sendButton');
+            const connectButton = document.getElementById('connectButton');
+            const statusDiv = document.getElementById('status');
+            const currentRoomSpan = document.getElementById('currentRoom');
+            const messagesDiv = document.getElementById('messages');
+
+            // Modal elements
+            const createRoomModal = document.getElementById('createRoomModal');
+            const joinRoomModal = document.getElementById('joinRoomModal');
+            const deleteRoomModal = document.getElementById('deleteRoomModal');
+
+            // Form elements
+            const newRoomNameInput = document.getElementById('newRoomName');
+            const privateRoomCheckbox = document.getElementById('privateRoom');
+            const passwordField = document.getElementById('passwordField');
+            const roomPasswordInput = document.getElementById('roomPassword');
+            const joinRoomPasswordInput = document.getElementById('joinRoomPassword');
+            const joinRoomNameDisplay = document.getElementById('joinRoomNameDisplay');
+            const deleteRoomNameDisplay = document.getElementById('deleteRoomNameDisplay');
+
+            function updateStatus(connected) {
+                if (connected) {
+                    statusDiv.textContent = 'Connected';
+                    statusDiv.className = 'status connected';
+                    messageInput.disabled = false;
+                    sendButton.disabled = false;
+                    connectButton.textContent = 'Disconnect';
+                } else {
+                    statusDiv.textContent = 'Disconnected';
+                    statusDiv.className = 'status disconnected';
+                    messageInput.disabled = true;
+                    sendButton.disabled = true;
+                    connectButton.textContent = 'Connect';
+                }
+            }
+
+            function updateRoomList(roomsData) {
+                const defaultRoomsDiv = document.getElementById('defaultRooms');
+                const privateRoomsDiv = document.getElementById('privateRooms');
+                
+                defaultRoomsDiv.innerHTML = '';
+                privateRoomsDiv.innerHTML = '';
+
+                roomsData.forEach(room => {
+                    const roomDiv = document.createElement('div');
+                    roomDiv.className = `room-item ${room.name === currentRoom ? 'active' : ''}`;
+                    
+                    if (room.private) {
+                        roomDiv.innerHTML = `
+                            <div class="room-item-name">
+                                <span>${room.name} <span class="private-badge">Private</span></span>
+                                <span>${room.clientCount} users</span>
+                            </div>
+                            <div class="room-item-info">Password protected</div>
+                        `;
+                        roomDiv.addEventListener('click', () => showJoinRoomModal(room.name, true));
+                        privateRoomsDiv.appendChild(roomDiv);
+                    } else {
+                        const deleteButton = room.isCreator && room.name !== 'default' 
+                            ? `<button class="delete-room-btn" onclick="showDeleteRoomModal('${room.name}')">Delete</button>` 
+                            : '';
+                        roomDiv.innerHTML = `
+                            <div class="room-item-name">
+                                <span>${room.name}</span>
+                                <span>${room.clientCount} users ${deleteButton}</span>
+                            </div>
+                            <div class="room-item-info">Public room</div>
+                        `;
+                        roomDiv.addEventListener('click', (e) => {
+                            if (!e.target.classList.contains('delete-room-btn')) {
+                                joinRoomByName(room.name, false);
+                            }
+                        });
+                        defaultRoomsDiv.appendChild(roomDiv);
+                    }
+                });
+            }
+
+            function updateCurrentRoom(roomName) {
+                currentRoom = roomName;
+                currentRoomSpan.textContent = `Current Room: ${roomName}`;
+            }
+
+            function connect() {
+                if (ws) {
+                    ws.close();
+                    ws = null;
+                    updateStatus(false);
+                    return;
+                }
+
+                ws = new WebSocket('ws://localhost:8080/ws');
+
+                ws.onopen = function(event) {
+                    updateStatus(true);
+                    messagesDiv.innerHTML = '';
+                    addMessage('Connected to WebSocket server', 'system');
+                    updateCurrentRoom('default');
+                    listRooms();
+                };
+
+                ws.onmessage = function(event) {
+                    if (event.data.includes('ROOMS_LIST:')) {
+                        const jsonStr = event.data.replace('ROOMS_LIST:', '');
+                        try {
+                            const roomsData = JSON.parse(jsonStr);
+                            updateRoomList(roomsData);
+                        } catch (e) {
+                            // Silently handle parsing errors
+                        }
+                    } else {
+                        const roomPrefixMatch = event.data.match(/^\[([^\]]+)\]/);
+                        if (roomPrefixMatch) {
+                            const messageRoom = roomPrefixMatch[1];
+                            if (messageRoom === currentRoom) {
+                                addMessage(event.data);
+                            }
+                        } else {
+                            addMessage(event.data);
+                        }
+                    }
+                };
+
+                ws.onclose = function(event) {
+                    updateStatus(false);
+                    addMessage('Disconnected from WebSocket server', 'system');
+                    ws = null;
+                };
+
+                ws.onerror = function(error) {
+                    addMessage('WebSocket error occurred', 'system');
+                };
+
+                // Close WebSocket when page is unloaded
+                window.addEventListener('beforeunload', function() {
+                    if (ws) {
+                        ws.close();
+                    }
+                });
+            }
+
+            function sendMessage() {
+                const message = messageInput.value.trim();
+                if (message && ws && ws.readyState === WebSocket.OPEN) {
+                    const wsMsg = {
+                        type: 'room_message',
+                        data: { content: message }
+                    };
+                    ws.send(JSON.stringify(wsMsg));
+                    messageInput.value = '';
+                }
+            }
+
+            function addMessage(content, type = 'user') {
+                const messageDiv = document.createElement('div');
+                
+                if (content.includes('has joined the room')) {
+                    messageDiv.className = 'message room_join';
+                } else if (content.includes('has left the room')) {
+                    messageDiv.className = 'message room_leave';
+                } else if (content.includes('Welcome to the chat')) {
+                    messageDiv.className = 'message system';
+                } else if (content.includes('Error')) {
+                    messageDiv.className = 'message system';
+                } else if (type === 'system') {
+                    messageDiv.className = 'message system';
+                } else {
+                    messageDiv.className = 'message received';
+                }
+
+                messageDiv.textContent = content;
+                messagesDiv.appendChild(messageDiv);
+                messagesDiv.scrollTop = messagesDiv.scrollHeight;
+            }
+
+            function joinRoomByName(roomName, isPrivate, password = '') {
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    const wsMsg = {
+                        type: 'join_room',
+                        data: { 
+                            name: roomName,
+                            password: password
+                        }
+                    };
+                    ws.send(JSON.stringify(wsMsg));
+                    updateCurrentRoom(roomName);
+                    messagesDiv.innerHTML = '';
+                    addMessage(`Joined room: ${roomName}`, 'system');
+                    listRooms();
+                }
+            }
+
+            function showCreateRoomModal() {
+                createRoomModal.classList.add('show');
+                newRoomNameInput.focus();
+            }
+
+            function hideCreateRoomModal() {
+                createRoomModal.classList.remove('show');
+                newRoomNameInput.value = '';
+                privateRoomCheckbox.checked = false;
+                roomPasswordInput.value = '';
+                passwordField.classList.remove('show');
+            }
+
+            function showJoinRoomModal(roomName, isPrivate) {
+                joinRoomNameDisplay.textContent = roomName;
+                
+                if (isPrivate) {
+                    document.getElementById('joinPasswordField').classList.add('show');
+                    joinRoomPasswordInput.value = '';
+                    joinRoomPasswordInput.focus();
+                }
+                
+                joinRoomModal.classList.add('show');
+            }
+
+            function hideJoinRoomModal() {
+                joinRoomModal.classList.remove('show');
+                joinRoomPasswordInput.value = '';
+            }
+
+            function showDeleteRoomModal(roomName) {
+                deleteRoomNameDisplay.textContent = roomName;
+                deleteRoomModal.classList.add('show');
+            }
+
+            function hideDeleteRoomModal() {
+                deleteRoomModal.classList.remove('show');
+            }
+
+            function leaveRoom() {
+                if (currentRoom === 'default') {
+                    addMessage('You are already in the default room', 'system');
+                    return;
+                }
+                
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    const wsMsg = {
+                        type: 'leave_room',
+                        data: {}
+                    };
+                    ws.send(JSON.stringify(wsMsg));
+                    messagesDiv.innerHTML = '';
+                    setTimeout(() => joinRoomByName('default', false), 100);
+                }
+            }
+
+            function listRooms() {
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    const wsMsg = {
+                        type: 'list_rooms',
+                        data: {}
+                    };
+                    ws.send(JSON.stringify(wsMsg));
+                }
+            }
+
+            // Event listeners
+            connectButton.addEventListener('click', connect);
+
+            sendButton.addEventListener('click', sendMessage);
+
+            messageInput.addEventListener('keypress', function(event) {
+                if (event.key === 'Enter') {
+                    sendButton.click();
+                }
+            });
+
+            document.getElementById('createRoom').addEventListener('click', showCreateRoomModal);
+            document.getElementById('leaveRoom').addEventListener('click', leaveRoom);
+
+            // Modal event listeners
+            document.getElementById('closeModal').addEventListener('click', hideCreateRoomModal);
+            document.getElementById('cancelCreateRoom').addEventListener('click', hideCreateRoomModal);
+            document.getElementById('confirmCreateRoom').addEventListener('click', function() {
+                const roomName = newRoomNameInput.value.trim();
+                const isPrivate = privateRoomCheckbox.checked;
+                const password = roomPasswordInput.value.trim();
+
+                if (!roomName) {
+                    alert('Please enter a room name');
+                    return;
+                }
+
+                if (isPrivate && !password) {
+                    alert('Please enter a password for private room');
+                    return;
+                }
+
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    const wsMsg = {
+                        type: 'create_room',
+                        data: { 
+                            name: roomName,
+                            private: isPrivate,
+                            password: password
+                        }
+                    };
+                    ws.send(JSON.stringify(wsMsg));
+                    hideCreateRoomModal();
+                    listRooms();
+                }
+            });
+
+            document.getElementById('listRooms').addEventListener('click', listRooms);
+
+            document.getElementById('closeJoinModal').addEventListener('click', hideJoinRoomModal);
+            document.getElementById('cancelJoinRoom').addEventListener('click', hideJoinRoomModal);
+            document.getElementById('confirmJoinRoom').addEventListener('click', function() {
+                const roomName = joinRoomNameDisplay.textContent;
+                const password = joinRoomPasswordInput.value.trim();
+                
+                if (password) {
+                    joinRoomByName(roomName, true, password);
+                } else {
+                    alert('Please enter the password');
+                }
+                hideJoinRoomModal();
+            });
+
+            document.getElementById('closeDeleteModal').addEventListener('click', hideDeleteRoomModal);
+            document.getElementById('cancelDeleteRoom').addEventListener('click', hideDeleteRoomModal);
+            document.getElementById('confirmDeleteRoom').addEventListener('click', function() {
+                const roomName = deleteRoomNameDisplay.textContent;
+                
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    const wsMsg = {
+                        type: 'delete_room',
+                        data: { name: roomName }
+                    };
+                    ws.send(JSON.stringify(wsMsg));
+                    hideDeleteRoomModal();
+                    listRooms();
+                }
+            });
+
+            // Close modals on outside click
+            createRoomModal.addEventListener('click', function(event) {
+                if (event.target === createRoomModal) hideCreateRoomModal();
+            });
+            joinRoomModal.addEventListener('click', function(event) {
+                if (event.target === joinRoomModal) hideJoinRoomModal();
+            });
+            deleteRoomModal.addEventListener('click', function(event) {
+                if (event.target === deleteRoomModal) hideDeleteRoomModal();
+            });
+
+            // Private room checkbox toggle
+            privateRoomCheckbox.addEventListener('change', function() {
+                passwordField.classList.toggle('show', this.checked);
+                if (!this.checked) roomPasswordInput.value = '';
+            });
+
+            // Enter key handlers
+            roomPasswordInput.addEventListener('keypress', function(event) {
+                if (event.key === 'Enter') document.getElementById('confirmCreateRoom').click();
+            });
+            joinRoomPasswordInput.addEventListener('keypress', function(event) {
+                if (event.key === 'Enter') document.getElementById('confirmJoinRoom').click();
+            });
+
+            // Make functions globally accessible for onclick handlers
+            window.showDeleteRoomModal = showDeleteRoomModal;
+
+            addMessage('WebSocket demo loaded. Click "Connect" to start.', 'system');
+        });
+    </script>
 </body>
 </html>
