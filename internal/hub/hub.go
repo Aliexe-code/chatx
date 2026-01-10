@@ -27,6 +27,7 @@ type Hub struct {
 	Mutex       sync.RWMutex
 	Ctx         context.Context
 	UserCount   int
+	roomOpMutex sync.Mutex // Prevents concurrent room operations on the same client
 }
 
 // NewHub creates and initializes a new Hub instance
@@ -50,27 +51,30 @@ func (h *Hub) CreateRoom(name string, private bool, password string, maxClients 
 		return nil, errors.New("invalid room name")
 	}
 
+	// Hold write lock during entire check-and-create operation to prevent race condition
+	h.Mutex.Lock()
+	defer h.Mutex.Unlock()
+
 	// Check if room already exists
-	h.Mutex.RLock()
 	if _, exists := h.Rooms[name]; exists {
-		h.Mutex.RUnlock()
 		return nil, errors.New("room already exists")
 	}
-	h.Mutex.RUnlock()
 
 	// Create new room
 	newRoom := room.NewRoom(name, private, password, maxClients)
 
 	// Add to hub's rooms map
-	h.Mutex.Lock()
 	h.Rooms[name] = newRoom
-	h.Mutex.Unlock()
 
 	return newRoom, nil
 }
 
 // JoinRoom adds a client to a room
 func (h *Hub) JoinRoom(client *client.Client, targetRoom *room.Room, password string) error {
+	// Lock to prevent concurrent room operations on the same client
+	h.roomOpMutex.Lock()
+	defer h.roomOpMutex.Unlock()
+
 	// Set the creator if this is the first client
 	if targetRoom.Creator == nil {
 		targetRoom.SetCreator(client)
@@ -93,7 +97,7 @@ func (h *Hub) JoinRoom(client *client.Client, targetRoom *room.Room, password st
 	}
 
 	// Remove client from any existing room
-	h.LeaveRoom(client)
+	h.leaveRoomInternal(client)
 
 	// Add client to new room
 	targetRoom.AddClient(client)
@@ -120,8 +124,8 @@ func (h *Hub) JoinRoom(client *client.Client, targetRoom *room.Room, password st
 	return nil
 }
 
-// LeaveRoom removes a client from their current room
-func (h *Hub) LeaveRoom(client *client.Client) {
+// leaveRoomInternal removes a client from their current room (internal use, assumes lock is held)
+func (h *Hub) leaveRoomInternal(client *client.Client) {
 	currentRoom := client.GetCurrentRoom()
 	if currentRoom == nil {
 		return // Not in any room
@@ -148,6 +152,14 @@ func (h *Hub) LeaveRoom(client *client.Client) {
 	timestamp := time.Now().Format("15:04:05")
 	leaveMsg := []byte(fmt.Sprintf("[%s] %s has left the room", timestamp, client.Name))
 	h.BroadcastToRoom(room, types.Message{Content: leaveMsg, Sender: nil, Type: types.MsgTypeRoomLeave})
+}
+
+// LeaveRoom removes a client from their current room
+func (h *Hub) LeaveRoom(client *client.Client) {
+	// Lock to prevent concurrent room operations on the same client
+	h.roomOpMutex.Lock()
+	defer h.roomOpMutex.Unlock()
+	h.leaveRoomInternal(client)
 }
 
 // DeleteRoom deletes a room and moves all clients to default room
