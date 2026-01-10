@@ -215,10 +215,18 @@ func (h *Hub) DeleteRoom(client *client.Client, roomName string) error {
 // BroadcastToRoom sends a message to all clients in a specific room
 func (h *Hub) BroadcastToRoom(targetRoom *room.Room, message types.Message) {
 	clients := targetRoom.GetClients()
+	log.Printf("BroadcastToRoom: Room '%s', Message type '%s', Total clients in room: %d", targetRoom.Name, message.Type, len(clients))
 
 	// Send to all clients in room
 	for _, client := range clients {
 		if client.Conn == nil {
+			log.Printf("BroadcastToRoom: Skipping client %s (nil connection)", client.Name)
+			continue
+		}
+
+		// Don't send the message back to the sender (for room messages)
+		if message.Type == types.MsgTypeRoomMessage && message.Sender != nil && client == message.Sender {
+			log.Printf("BroadcastToRoom: Skipping sender %s", client.Name)
 			continue
 		}
 
@@ -229,7 +237,10 @@ func (h *Hub) BroadcastToRoom(targetRoom *room.Room, message types.Message) {
 		err := client.Conn.Write(h.Ctx, websocket.MessageText, formattedContent)
 		if err != nil {
 			// Handle write error - client likely disconnected
+			log.Printf("BroadcastToRoom: Error writing to client %s: %v", client.Name, err)
 			h.Unregister <- client
+		} else {
+			log.Printf("BroadcastToRoom: Sent message to client %s: %s", client.Name, string(formattedContent))
 		}
 	}
 }
