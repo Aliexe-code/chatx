@@ -402,9 +402,10 @@ func TestConcurrentServerOperations(t *testing.T) {
 
 			for j, op := range operations {
 				msg := op
-				if j == 0 {
+				switch j {
+				case 0:
 					msg = fmt.Sprintf(op, id)
-				} else if j == 2 {
+				case 2:
 					msg = fmt.Sprintf(op, id)
 				}
 				conn.Write(ctx, websocket.MessageText, []byte(msg))
