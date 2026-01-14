@@ -8,11 +8,14 @@ import (
 
 // Client represents a WebSocket client connection
 type Client struct {
-	Conn        *websocket.Conn
-	Name        string
-	Registered  chan struct{} // Signal when this client is registered
-	CurrentRoom interface{}   // Track current room (will be *room.Room)
-	RoomMutex   sync.RWMutex  // Thread safety for room tracking
+	Conn           *websocket.Conn
+	Name           string
+	UserID         string
+	Registered     chan struct{} // Signal when this client is registered
+	Authenticated  bool          // Track if client is authenticated
+	CurrentRoom    interface{}   // Track current room (will be *room.Room)
+	RoomMutex      sync.RWMutex  // Thread safety for room tracking
+	RegisteredOnce sync.Once     // Ensure Registered channel is closed only once
 }
 
 // NewClient creates a new client instance

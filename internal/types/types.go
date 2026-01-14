@@ -21,7 +21,26 @@ type WebSocketMessage struct {
 		Password string `json:"password,omitempty"`
 		Content  string `json:"content,omitempty"`
 		Private  bool   `json:"private,omitempty"`
+		Limit    int    `json:"limit,omitempty"`
+		Offset   int    `json:"offset,omitempty"`
 	} `json:"data,omitempty"`
+}
+
+// ChatMessage represents a chat message in JSON format
+type ChatMessage struct {
+	Type      string `json:"type"`
+	Timestamp string `json:"timestamp"`
+	Sender    string `json:"sender"`
+	Content   string `json:"content"`
+	Room      string `json:"room,omitempty"`
+}
+
+// RoomDTO represents a room information sent to clients
+type RoomDTO struct {
+	Name        string `json:"name"`
+	Private     bool   `json:"private"`
+	ClientCount int    `json:"clientCount"`
+	IsCreator   bool   `json:"isCreator"`
 }
 
 // Message type constants
@@ -37,4 +56,5 @@ const (
 	MsgTypeListRooms   = "list_rooms"
 	MsgTypeRoomMessage = "room_message"
 	MsgTypeDeleteRoom  = "delete_room"
+	MsgTypeGetMessages = "get_messages"
 )

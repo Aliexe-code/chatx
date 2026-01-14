@@ -5,117 +5,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"math/rand"
 	"time"
 
 	"websocket-demo/internal/client"
 	"websocket-demo/internal/hub"
+	"websocket-demo/internal/room"
 	"websocket-demo/internal/types"
 
 	"github.com/coder/websocket"
-	"github.com/labstack/echo/v4"
+	"github.com/jackc/pgx/v5/pgtype"
 )
-
-// HandleWebSocket handles individual WebSocket client connections
-// It manages the lifecycle of each client connection including registration, message handling, and cleanup
-func HandleWebSocket(hub *hub.Hub, c echo.Context) error {
-	log.Printf("New WebSocket connection attempt from %s", c.RealIP())
-
-	opts := &websocket.AcceptOptions{
-		OriginPatterns: []string{"*"},
-	}
-
-	conn, err := websocket.Accept(c.Response(), c.Request(), opts)
-	if err != nil {
-		log.Printf("WebSocket upgrade error: %v", err)
-		return echo.NewHTTPError(400, "WebSocket upgrade failed")
-	}
-	log.Printf("WebSocket connection established successfully")
-
-	defer func() {
-		if conn != nil {
-			conn.Close(websocket.StatusNormalClosure, "server shutting down")
-		}
-	}()
-
-	// Generate a unique user name
-	userName := fmt.Sprintf("User%d", rand.Intn(9000)+1000)
-	newClient := client.NewClient(conn, userName)
-	log.Printf("Created client with name: %s", userName)
-
-	// Register the client
-	hub.Register <- newClient
-	log.Printf("Client %s queued for registration", userName)
-
-	// Wait for this client's registration to complete with timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	select {
-	case <-newClient.Registered:
-		log.Printf("Registration confirmed for %s", userName)
-	case <-ctx.Done():
-		log.Printf("Registration timeout for %s", userName)
-		return echo.NewHTTPError(408, "Registration timeout")
-	}
-
-	// Send welcome message to the new client
-	timestamp := time.Now().Format("15:04:05")
-	welcomeMsg := []byte(fmt.Sprintf("[%s] Welcome to the chat! Your name is %s", timestamp, userName))
-	err = conn.Write(context.Background(), websocket.MessageText, welcomeMsg)
-	if err != nil {
-		log.Printf("Error sending welcome message to %s: %v", userName, err)
-		// Don't return here as welcome message failure shouldn't close the connection
-	} else {
-		log.Printf("Welcome message sent to %s", userName)
-	}
-
-	for {
-		_, message, err := conn.Read(context.Background())
-		if err != nil {
-			log.Printf("Read message error from %s: %v", userName, err)
-			hub.Unregister <- newClient
-			break
-		}
-
-		log.Printf("Received message from %s: %s", userName, string(message))
-
-		// Parse WebSocket message
-		wsMsg, err := ParseWebSocketMessage(message)
-		if err != nil {
-			log.Printf("Error parsing WebSocket message from %s: %v", userName, err)
-			errorMsg := []byte(fmt.Sprintf("Error parsing message: %v", err))
-			newClient.Conn.Write(context.Background(), websocket.MessageText, errorMsg)
-		} else if wsMsg != nil {
-			log.Printf("Parsed WebSocket message type: %s", wsMsg.Type)
-			err := HandleWebSocketMessage(hub, newClient, wsMsg)
-			if err != nil {
-				log.Printf("Error handling WebSocket message from %s: %v", userName, err)
-				errorMsg := []byte(fmt.Sprintf("Error: %v", err))
-				newClient.Conn.Write(context.Background(), websocket.MessageText, errorMsg)
-			}
-		} else {
-			// Handle legacy chat messages
-			timestamp := time.Now().Format("15:04:05")
-			formattedMsg := []byte(fmt.Sprintf("[%s] %s: %s", timestamp, userName, string(message)))
-			log.Printf("Attempting to send message from %s to broadcast channel", userName)
-
-			// Send to broadcast channel with timeout
-			ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-			defer cancel()
-
-			select {
-			case hub.Broadcast <- types.Message{Content: formattedMsg, Sender: newClient, Type: types.MsgTypeChat}:
-				log.Printf("Message from %s queued for broadcast", userName)
-			case <-ctx.Done():
-				log.Printf("Broadcast timeout for %s", userName)
-				// Continue processing other messages
-			}
-		}
-	}
-
-	return nil
-}
 
 // HandleWebSocketMessage processes WebSocket messages and routes them appropriately
 func HandleWebSocketMessage(hub *hub.Hub, client *client.Client, wsMsg *types.WebSocketMessage) error {
@@ -131,9 +30,33 @@ func HandleWebSocketMessage(hub *hub.Hub, client *client.Client, wsMsg *types.We
 		currentRoom := client.GetCurrentRoom()
 
 		if currentRoom != nil {
+			// Save message to database if client is authenticated
+			if client.Authenticated && client.UserID != "" && hub.Repo != nil {
+				if room, ok := currentRoom.(*room.Room); ok && room.ID != "" {
+					ctx := context.Background()
+					var senderUUID pgtype.UUID
+					var roomUUID pgtype.UUID
+					if err := senderUUID.Scan(client.UserID); err == nil {
+						if err := roomUUID.Scan(room.ID); err == nil {
+							_, err := hub.Repo.CreateMessage(ctx, roomUUID, senderUUID, wsMsg.Data.Content)
+							if err != nil {
+								log.Printf("Failed to save room message to database: %v", err)
+							}
+						}
+					}
+				}
+			}
+
 			timestamp := time.Now().Format("15:04:05")
 			formattedMsg := []byte(fmt.Sprintf("[%s] %s: %s", timestamp, client.Name, wsMsg.Data.Content))
 			hub.Broadcast <- types.Message{Content: formattedMsg, Sender: client, Type: types.MsgTypeRoomMessage, Room: currentRoom}
+			// Send success message to sender
+			successMsg := []byte("Message sent to room")
+			client.Conn.Write(context.Background(), websocket.MessageText, successMsg)
+		} else {
+			// Send error message if not in a room
+			errorMsg := []byte("You are not in a room")
+			client.Conn.Write(context.Background(), websocket.MessageText, errorMsg)
 		}
 
 	case types.MsgTypeCreateRoom:
@@ -146,8 +69,9 @@ func HandleWebSocketMessage(hub *hub.Hub, client *client.Client, wsMsg *types.We
 		} else {
 			// Set the creator
 			newRoom.SetCreator(client)
-			// Add client to new room
-			hub.JoinRoom(client, newRoom, "")
+			// Send success message
+			successMsg := []byte(fmt.Sprintf("Room '%s' created successfully", wsMsg.Data.Name))
+			client.Conn.Write(context.Background(), websocket.MessageText, successMsg)
 		}
 
 	case types.MsgTypeJoinRoom:
@@ -171,6 +95,12 @@ func HandleWebSocketMessage(hub *hub.Hub, client *client.Client, wsMsg *types.We
 		// Handle room leaving
 		hub.LeaveRoom(client)
 
+		// Send leave confirmation response
+		leaveResponse := []byte("ROOM_LEAVE_SUCCESS:You have successfully left the room")
+		if err := client.Conn.Write(context.Background(), websocket.MessageText, leaveResponse); err != nil {
+			log.Printf("Failed to send leave response to client %s: %v", client.Name, err)
+		}
+
 	case types.MsgTypeListRooms:
 		// Handle room listing with detailed info
 		roomList := hub.GetRoomList(client)
@@ -189,6 +119,73 @@ func HandleWebSocketMessage(hub *hub.Hub, client *client.Client, wsMsg *types.We
 			// Send success message
 			successMsg := []byte(fmt.Sprintf("Room '%s' deleted successfully", wsMsg.Data.Name))
 			client.Conn.Write(context.Background(), websocket.MessageText, successMsg)
+		}
+
+	case types.MsgTypeGetMessages:
+		// Handle getting messages for a room
+		// Check if user is joined to the requested room
+		currentRoomInterface := client.GetCurrentRoom()
+		if currentRoomInterface != nil {
+			currentRoom := currentRoomInterface.(*room.Room)
+			if currentRoom.Name == wsMsg.Data.Name {
+				// User is in the requested room, fetch messages
+				ctx := context.Background()
+
+				// Get room ID as pgtype.UUID
+				var roomUUID pgtype.UUID
+				if err := roomUUID.Scan(currentRoom.ID); err != nil {
+					errorMsg := []byte(fmt.Sprintf("Error parsing room ID: %v", err))
+					client.Conn.Write(context.Background(), websocket.MessageText, errorMsg)
+					break
+				}
+
+				// Set default values for limit and offset
+				limit := int32(wsMsg.Data.Limit)
+				offset := int32(wsMsg.Data.Offset)
+				if limit <= 0 {
+					limit = 50 // default limit
+				}
+				if offset < 0 {
+					offset = 0 // default offset
+				}
+
+				// Fetch messages from database
+				messages, err := hub.Repo.ListMessagesByRoom(ctx, roomUUID, limit, offset)
+				if err != nil {
+					errorMsg := []byte(fmt.Sprintf("Error fetching messages: %v", err))
+					client.Conn.Write(context.Background(), websocket.MessageText, errorMsg)
+					break
+				}
+
+				// Format messages as JSON
+				type MessageResponse struct {
+					Username  string `json:"username"`
+					Content   string `json:"content"`
+					Timestamp string `json:"timestamp"`
+				}
+
+				var messageResponses []MessageResponse
+				for _, msg := range messages {
+					messageResponses = append(messageResponses, MessageResponse{
+						Username:  msg.Username,
+						Content:   msg.Content,
+						Timestamp: msg.CreatedAt.Time.Format(time.RFC3339),
+					})
+				}
+
+				// Send messages back to client
+				messagesJSON, _ := json.Marshal(messageResponses)
+				responseMsg := []byte(fmt.Sprintf("MESSAGES:%s", string(messagesJSON)))
+				client.Conn.Write(context.Background(), websocket.MessageText, responseMsg)
+			} else {
+				// User is in a different room
+				errorMsg := []byte("You can only get messages from the room you have joined")
+				client.Conn.Write(context.Background(), websocket.MessageText, errorMsg)
+			}
+		} else {
+			// User is not in any room
+			errorMsg := []byte("You must join a room first to get messages")
+			client.Conn.Write(context.Background(), websocket.MessageText, errorMsg)
 		}
 
 	default:

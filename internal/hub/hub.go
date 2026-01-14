@@ -2,17 +2,24 @@ package hub
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"sync"
 	"time"
 
+	"golang.org/x/crypto/bcrypt"
+
 	"websocket-demo/internal/client"
+	"websocket-demo/internal/repository"
 	"websocket-demo/internal/room"
 	"websocket-demo/internal/types"
+	"websocket-demo/internal/validator"
 
 	"github.com/coder/websocket"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 // Hub manages all WebSocket connections and broadcasts messages between clients
@@ -24,6 +31,7 @@ type Hub struct {
 	Broadcast   chan types.Message
 	Register    chan *client.Client
 	Unregister  chan *client.Client
+	Repo        *repository.Repository
 	Mutex       sync.RWMutex
 	Ctx         context.Context
 	UserCount   int
@@ -31,14 +39,15 @@ type Hub struct {
 }
 
 // NewHub creates and initializes a new Hub instance
-func NewHub(ctx context.Context) *Hub {
+func NewHub(ctx context.Context, repo *repository.Repository) *Hub {
 	return &Hub{
 		Clients:     make(map[*client.Client]bool),
 		Rooms:       make(map[string]*room.Room),
 		ClientRooms: make(map[*client.Client]*room.Room),
-		Broadcast:   make(chan types.Message, 100), // Buffered channel to avoid blocking
-		Register:    make(chan *client.Client),
-		Unregister:  make(chan *client.Client),
+		Broadcast:   make(chan types.Message, 100),  // Buffered channel to avoid blocking
+		Register:    make(chan *client.Client, 100), // Buffered to prevent deadlocks
+		Unregister:  make(chan *client.Client, 100), // Buffered to prevent deadlocks
+		Repo:        repo,
 		Ctx:         ctx,
 		UserCount:   0,
 	}
@@ -55,7 +64,16 @@ func (h *Hub) CreateRoom(name string, private bool, password string, maxClients 
 	h.Mutex.Lock()
 	defer h.Mutex.Unlock()
 
-	// Check if room already exists
+	// Check if room already exists in database
+	if h.Repo != nil {
+		ctx := context.Background()
+		_, err := h.Repo.GetRoomByName(ctx, name)
+		if err == nil {
+			return nil, errors.New("room already exists")
+		}
+	}
+
+	// Check if room already exists in memory
 	if _, exists := h.Rooms[name]; exists {
 		return nil, errors.New("room already exists")
 	}
@@ -66,14 +84,44 @@ func (h *Hub) CreateRoom(name string, private bool, password string, maxClients 
 	// Add to hub's rooms map
 	h.Rooms[name] = newRoom
 
+	// Persist room to database if repository is available
+	if h.Repo != nil {
+		ctx := context.Background()
+		passwordHash := pgtype.Text{Valid: false}
+		if private && password != "" {
+			// Hash the password using bcrypt
+			hashedPassword, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+			if err != nil {
+				log.Printf("Failed to hash room password: %v", err)
+				return nil, fmt.Errorf("failed to hash password: %w", err)
+			}
+			passwordHash = pgtype.Text{String: string(hashedPassword), Valid: true}
+		}
+
+		creatorID := pgtype.UUID{Valid: false}
+		if newRoom.Creator != nil && newRoom.Creator.UserID != "" {
+			creatorID.Scan(newRoom.Creator.UserID)
+		}
+
+		dbRoom, err := h.Repo.CreateRoom(ctx, name, pgtype.Bool{Bool: private, Valid: true}, passwordHash, creatorID)
+		if err != nil {
+			log.Printf("Failed to persist room %s to database: %v", name, err)
+			// Continue with in-memory room for now
+		} else {
+			// Store database ID in room for future reference
+			newRoom.ID = uuid.UUID(dbRoom.ID.Bytes).String()
+			log.Printf("Room %s persisted to database with ID %s", name, newRoom.ID)
+		}
+	}
+
 	return newRoom, nil
 }
 
 // JoinRoom adds a client to a room
 func (h *Hub) JoinRoom(client *client.Client, targetRoom *room.Room, password string) error {
-	// Lock to prevent concurrent room operations on the same client
+	// Acquire locks in consistent order: h.Mutex first, then roomOpMutex
+	h.Mutex.Lock()
 	h.roomOpMutex.Lock()
-	defer h.roomOpMutex.Unlock()
 
 	// Set the creator if this is the first client
 	if targetRoom.Creator == nil {
@@ -81,17 +129,24 @@ func (h *Hub) JoinRoom(client *client.Client, targetRoom *room.Room, password st
 	}
 	// Validate room is active
 	if !targetRoom.Active {
+		h.roomOpMutex.Unlock()
+		h.Mutex.Unlock()
 		return errors.New("room is not active")
 	}
 
 	// Check max clients
 	if !targetRoom.AddClient(client) {
+		h.roomOpMutex.Unlock()
+		h.Mutex.Unlock()
 		return errors.New("room is full")
 	}
 
 	// Validate password for private rooms
 	if targetRoom.Private {
 		if !h.VerifyPassword(password, targetRoom.Password) {
+			targetRoom.RemoveClient(client) // Rollback
+			h.roomOpMutex.Unlock()
+			h.Mutex.Unlock()
 			return errors.New("invalid password")
 		}
 	}
@@ -106,8 +161,24 @@ func (h *Hub) JoinRoom(client *client.Client, targetRoom *room.Room, password st
 	client.SetCurrentRoom(targetRoom)
 
 	// Update hub's client-to-room mapping
-	h.Mutex.Lock()
 	h.ClientRooms[client] = targetRoom
+
+	// Persist room membership to database if repository is available
+	if h.Repo != nil && client.UserID != "" {
+		ctx := context.Background()
+		roomID := pgtype.UUID{}
+		userID := pgtype.UUID{}
+
+		if err := roomID.Scan(targetRoom.ID); err == nil {
+			if err := userID.Scan(client.UserID); err == nil {
+				if err := h.Repo.AddRoomMember(ctx, roomID, userID); err != nil {
+					log.Printf("Failed to persist room membership for user %s in room %s: %v", client.UserID, targetRoom.Name, err)
+				}
+			}
+		}
+	}
+
+	h.roomOpMutex.Unlock()
 	h.Mutex.Unlock()
 
 	// Broadcast room join notification
@@ -124,7 +195,7 @@ func (h *Hub) JoinRoom(client *client.Client, targetRoom *room.Room, password st
 	return nil
 }
 
-// leaveRoomInternal removes a client from their current room (internal use, assumes lock is held)
+// leaveRoomInternal removes a client from their current room (internal use, assumes h.Mutex and roomOpMutex are held)
 func (h *Hub) leaveRoomInternal(client *client.Client) {
 	currentRoom := client.GetCurrentRoom()
 	if currentRoom == nil {
@@ -144,11 +215,30 @@ func (h *Hub) leaveRoomInternal(client *client.Client) {
 	client.SetCurrentRoom(nil)
 
 	// Update hub's client-to-room mapping
-	h.Mutex.Lock()
 	delete(h.ClientRooms, client)
-	h.Mutex.Unlock()
 
-	// Broadcast room leave notification
+	// Remove room membership from database if repository is available
+	if h.Repo != nil && client.UserID != "" {
+		ctx := context.Background()
+		roomID := pgtype.UUID{}
+		userID := pgtype.UUID{}
+
+		if err := roomID.Scan(room.ID); err == nil {
+			if err := userID.Scan(client.UserID); err == nil {
+				if err := h.Repo.RemoveRoomMember(ctx, roomID, userID); err != nil {
+					log.Printf("Failed to remove room membership for user %s from room %s: %v", client.UserID, room.Name, err)
+				}
+			}
+		}
+	}
+
+	// Send confirmation to the leaving user
+	leaveConfirmMsg := []byte(fmt.Sprintf("You have left the room \"%s\"", room.Name))
+	if err := client.Conn.Write(context.Background(), websocket.MessageText, leaveConfirmMsg); err != nil {
+		log.Printf("Failed to send leave confirmation to %s: %v", client.Name, err)
+	}
+
+	// Broadcast room leave notification to remaining room members
 	timestamp := time.Now().Format("15:04:05")
 	leaveMsg := []byte(fmt.Sprintf("[%s] %s has left the room", timestamp, client.Name))
 	h.BroadcastToRoom(room, types.Message{Content: leaveMsg, Sender: nil, Type: types.MsgTypeRoomLeave})
@@ -156,13 +246,15 @@ func (h *Hub) leaveRoomInternal(client *client.Client) {
 
 // LeaveRoom removes a client from their current room
 func (h *Hub) LeaveRoom(client *client.Client) {
-	// Lock to prevent concurrent room operations on the same client
+	// Acquire locks in consistent order: h.Mutex first, then roomOpMutex
+	h.Mutex.Lock()
 	h.roomOpMutex.Lock()
-	defer h.roomOpMutex.Unlock()
 	h.leaveRoomInternal(client)
+	h.roomOpMutex.Unlock()
+	h.Mutex.Unlock()
 }
 
-// DeleteRoom deletes a room and moves all clients to default room
+// DeleteRoom deletes a room
 func (h *Hub) DeleteRoom(client *client.Client, roomName string) error {
 	h.Mutex.RLock()
 	targetRoom, exists := h.Rooms[roomName]
@@ -177,37 +269,15 @@ func (h *Hub) DeleteRoom(client *client.Client, roomName string) error {
 		return errors.New("only the room creator can delete this room")
 	}
 
-	// Cannot delete default room
-	if roomName == "default" {
-		return errors.New("cannot delete default room")
-	}
-
-	// Move all clients to default room
-	clients := targetRoom.GetClients()
-
-	// Get default room
-	h.Mutex.RLock()
-	defaultRoom, defaultExists := h.Rooms["default"]
-	h.Mutex.RUnlock()
-
-	if !defaultExists {
-		defaultRoom, _ = h.CreateRoom("default", false, "", 1000)
-	}
-
-	// Move all clients to default room
-	for _, c := range clients {
-		h.JoinRoom(c, defaultRoom, "")
-	}
+	// Broadcast room deletion notification globally
+	timestamp := time.Now().Format("15:04:05")
+	deleteMsg := []byte(fmt.Sprintf("[%s] Room '%s' has been deleted by %s", timestamp, roomName, client.Name))
+	h.Broadcast <- types.Message{Content: deleteMsg, Sender: nil, Type: types.MsgTypeDeleteRoom}
 
 	// Remove room from hub
 	h.Mutex.Lock()
 	delete(h.Rooms, roomName)
 	h.Mutex.Unlock()
-
-	// Broadcast room deletion notification
-	timestamp := time.Now().Format("15:04:05")
-	deleteMsg := []byte(fmt.Sprintf("[%s] Room '%s' has been deleted by %s", timestamp, roomName, client.Name))
-	h.BroadcastToRoom(defaultRoom, types.Message{Content: deleteMsg, Sender: nil, Type: types.MsgTypeDeleteRoom})
 
 	return nil
 }
@@ -217,6 +287,7 @@ func (h *Hub) BroadcastToRoom(targetRoom *room.Room, message types.Message) {
 	clients := targetRoom.GetClients()
 	log.Printf("BroadcastToRoom: Room '%s', Message type '%s', Total clients in room: %d", targetRoom.Name, message.Type, len(clients))
 
+	clientsToRemove := make([]*client.Client, 0)
 	// Send to all clients in room
 	for _, client := range clients {
 		if client.Conn == nil {
@@ -230,26 +301,39 @@ func (h *Hub) BroadcastToRoom(targetRoom *room.Room, message types.Message) {
 			continue
 		}
 
+		// Validate message size before broadcasting
+		maxSize := validator.GetMaxMessageSize()
+		if err := validator.ValidateMessageSize(len(message.Content), maxSize); err != nil {
+			log.Printf("BroadcastToRoom: Skipping message to %s due to size validation: %v", client.Name, err)
+			return // Skip this message
+		}
+
 		// Format message with room prefix
 		roomPrefix := fmt.Sprintf("[%s] ", targetRoom.Name)
 		formattedContent := append([]byte(roomPrefix), message.Content...)
 
-		err := client.Conn.Write(h.Ctx, websocket.MessageText, formattedContent)
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+		err := client.Conn.Write(ctx, websocket.MessageText, formattedContent)
+		cancel()
 		if err != nil {
 			// Handle write error - client likely disconnected
 			log.Printf("BroadcastToRoom: Error writing to client %s: %v", client.Name, err)
-			h.Unregister <- client
+			clientsToRemove = append(clientsToRemove, client)
 		} else {
 			log.Printf("BroadcastToRoom: Sent message to client %s: %s", client.Name, string(formattedContent))
 		}
+	}
+	// Unregister failed clients
+	for _, c := range clientsToRemove {
+		h.Unregister <- c
 	}
 }
 
 // VerifyPassword checks if the provided password matches the correct password
 func (h *Hub) VerifyPassword(inputPassword, correctPassword string) bool {
-	// For simplicity, using direct comparison
-	// In production, use proper password hashing
-	return inputPassword == correctPassword
+	// Compare using bcrypt to verify hashed passwords
+	err := bcrypt.CompareHashAndPassword([]byte(correctPassword), []byte(inputPassword))
+	return err == nil
 }
 
 // Run starts the Hub's main loop that processes client connections and broadcasts messages
@@ -279,38 +363,12 @@ func (h *Hub) Run() {
 				log.Printf("Client %s connected. Total clients: %d", client.Name, h.UserCount)
 
 				// Signal that this client's registration is complete FIRST
-				close(client.Registered)
+				client.RegisteredOnce.Do(func() {
+					close(client.Registered)
+				})
 				log.Printf("Registration signal sent for %s", client.Name)
 
-				// Create default room if it doesn't exist
-				h.Mutex.RLock()
-				_, defaultExists := h.Rooms["default"]
-				h.Mutex.RUnlock()
-
-				if !defaultExists {
-					h.CreateRoom("default", false, "", 1000)
-				}
-
-				// Then broadcast join notification to all other clients (non-blocking)
-				go func() {
-					timestamp := time.Now().Format("15:04:05")
-					joinMsg := []byte(fmt.Sprintf("[%s] %s has joined the chat", timestamp, client.Name))
-					select {
-					case h.Broadcast <- types.Message{Content: joinMsg, Sender: client, Type: types.MsgTypeJoin}:
-						log.Printf("Join notification queued for %s", client.Name)
-					case <-time.After(100 * time.Millisecond):
-						log.Printf("Warning: Could not send join notification for %s (channel blocked)", client.Name)
-					}
-				}()
-
-				// Join client to default room
-				h.Mutex.RLock()
-				defaultRoom := h.Rooms["default"]
-				h.Mutex.RUnlock()
-
-				if defaultRoom != nil {
-					h.JoinRoom(client, defaultRoom, "")
-				}
+				// Join notification removed
 			}
 
 		case client := <-h.Unregister:
@@ -333,6 +391,28 @@ func (h *Hub) Run() {
 			}
 
 		case message := <-h.Broadcast:
+			// Save chat messages to database
+			if (message.Type == types.MsgTypeChat || message.Type == types.MsgTypeRoomMessage) && message.Sender != nil {
+				if sender, ok := message.Sender.(*client.Client); ok && sender.Authenticated && sender.UserID != "" {
+					// Parse the message content to get chat content
+					var chatMsg types.ChatMessage
+					if err := json.Unmarshal(message.Content, &chatMsg); err == nil {
+						// Save to database if repository is available
+						if h.Repo != nil {
+							var senderUUID pgtype.UUID
+							if err := senderUUID.Scan(sender.UserID); err == nil {
+								ctx := context.Background()
+								// Save message to database (use null UUID for global chat - no room)
+								_, err := h.Repo.CreateMessage(ctx, pgtype.UUID{Valid: false}, senderUUID, chatMsg.Content)
+								if err != nil {
+									log.Printf("Failed to save chat message to database: %v", err)
+								}
+							}
+						}
+					}
+				}
+			}
+
 			// Handle room-specific broadcasts
 			if message.Room != nil {
 				// Type assertion
@@ -399,24 +479,53 @@ func (h *Hub) GetRoom(name string) (*room.Room, bool) {
 }
 
 // GetRoomList returns a list of all rooms with their information
-func (h *Hub) GetRoomList(client *client.Client) []map[string]interface{} {
+func (h *Hub) GetRoomList(client *client.Client) []types.RoomDTO {
 	h.Mutex.RLock()
-	defer h.Mutex.RUnlock()
+	rooms := make(map[string]*room.Room)
+	for name, r := range h.Rooms {
+		rooms[name] = r
+	}
+	h.Mutex.RUnlock()
 
-	roomList := make([]map[string]interface{}, 0, len(h.Rooms))
-	for name, room := range h.Rooms {
+	roomList := make([]types.RoomDTO, 0, len(rooms))
+	for name, room := range rooms {
 		room.Mutex.RLock()
 		clientCount := len(room.Clients)
 		isCreator := room.Creator == client
 		room.Mutex.RUnlock()
 
-		roomInfo := map[string]interface{}{
-			"name":        name,
-			"private":     room.Private,
-			"clientCount": clientCount,
-			"isCreator":   isCreator,
+		roomInfo := types.RoomDTO{
+			Name:        name,
+			Private:     room.Private,
+			ClientCount: clientCount,
+			IsCreator:   isCreator,
 		}
 		roomList = append(roomList, roomInfo)
 	}
 	return roomList
+}
+
+// LoadRoomsFromDB loads all rooms from the database into memory
+func (h *Hub) LoadRoomsFromDB() {
+	if h.Repo == nil {
+		return
+	}
+
+	ctx := context.Background()
+	dbRooms, err := h.Repo.GetAllRooms(ctx)
+	if err != nil {
+		log.Printf("Failed to load rooms from DB: %v", err)
+		return
+	}
+
+	h.Mutex.Lock()
+	for _, dbRoom := range dbRooms {
+		room := room.NewRoom(dbRoom.Name, dbRoom.Private.Bool, dbRoom.PasswordHash.String, 100)
+		room.ID = uuid.UUID(dbRoom.ID.Bytes).String()
+		// Creator not loaded, set to nil
+		h.Rooms[dbRoom.Name] = room
+	}
+	h.Mutex.Unlock()
+
+	log.Printf("Loaded %d rooms from database", len(dbRooms))
 }

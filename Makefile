@@ -1,15 +1,21 @@
 .PHONY: build run test clean race lint help
 
-# Build the application
+# Build application
 build:
 	@echo "Building server..."
 	@go build -o websocket-server ./cmd/server
 	@echo "Build complete: ./websocket-server"
 
-# Run the server
+# Run server
 run: build
 	@echo "Starting server..."
-	@./websocket-server
+	@if [ -f .env ]; then \
+		export $$(grep -v '^#' .env | xargs); \
+		./websocket-server; \
+	else \
+		echo "Warning: .env file not found. Please create one with your DATABASE_URL and JWT_SECRET. See .env.example for reference."; \
+		./websocket-server; \
+	fi
 
 # Run tests
 test:

@@ -9,6 +9,7 @@ import (
 
 // Room represents a chat room
 type Room struct {
+	ID         string // Database ID
 	Name       string
 	Clients    map[*client.Client]bool
 	Mutex      sync.RWMutex
