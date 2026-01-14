@@ -6,52 +6,47 @@ A high-performance, concurrent-safe real-time chat application built with Go, We
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![WebSocket](https://img.shields.io/badge/WebSocket-RFC--6455-010101?style=flat)
 
-## 🌟 Features
 
-### Core Functionality
-- **Real-time Messaging** - Instant message delivery using WebSocket protocol
-- **Room Management** - Create, join, leave, and delete chat rooms
-- **Public & Private Rooms** - Support for both public and password-protected private rooms
-- **User Presence** - Track online users and room membership
-- **Broadcast Messaging** - Efficient message broadcasting to all room members
-- **Graceful Shutdown** - Clean connection handling on server shutdown
+## 🚀 Features
 
-### Technical Highlights
-- **Concurrent-Safe Architecture** - Thread-safe operations using mutexes and channels
-- **Hub Pattern** - Centralized connection management for scalability
-- **Race Condition Free** - All code verified with Go's race detector
-- **Comprehensive Testing** - Unit tests with high coverage
-- **Clean Architecture** - Separation of concerns with internal packages
+### 📡 WebSocket Features
+- **Real-time Messaging**: Instant message delivery in chat rooms
+- **Room Management**: Create, join, leave, delete with password protection
+- **Private Rooms**: Password-protected rooms with secure authentication
+- **Public Rooms**: Open-access rooms for general discussions
+- **Message History**: Paginated message retrieval with filtering
+- **User Presence**: Track online users and room membership in real-time
+- **Broadcast System**: Efficient multi-client message delivery
+- **Connection Management**: Graceful client connection handling with cleanup
+- **Leave Notifications**: User feedback and room member notifications
+- **Message Size Limits**: Configurable limits to prevent DoS attacks
 
-## 🚀 Quick Start
 
-### Prerequisites
-- Go 1.25.5 or higher
-- Modern web browser with WebSocket support
 
-### Installation
+### 🛡️ Security & Authentication
+- **JWT Authentication**: Secure token-based user authentication with bcrypt password hashing
+- **CSRF Protection**: Cross-site request forgery prevention with token validation
+- **Input Validation**: Comprehensive validation for usernames, emails, passwords, and messages
+- **Rate Limiting**: Protection against message flooding and API abuse with configurable limits
+- **Password Hashing**: bcrypt hashing for both user and room passwords
+- **Audit Logging**: Security event tracking and monitoring for compliance
+- **Environment Variables**: Secure configuration management without hardcoded secrets
 
-1. Clone the repository:
-```bash
-git clone https://github.com/Aliexe-code/chatx.git
-cd chatx
-```
+### 🗄️ Database Integration
+- **PostgreSQL Integration**: Full SQLC-powered type-safe database operations
+- **Repository Pattern**: Clean data access abstraction with proper error handling
+- **Migration System**: Database schema evolution management with versioning
+- **Connection Pooling**: Configurable database connections for optimal performance
+- **Persistent Storage**: Users, rooms, messages, and room memberships
+- **ACID Compliance**: Transaction-safe database operations
 
-2. Install dependencies:
-```bash
-go mod download
-```
+## 🛠️ Technology Stack
 
-3. Run the server:
-```bash
-make run
-```
-
-4. Open your browser and navigate to:
-```
-http://localhost:8080
-```
-
+- **Backend**: Go 1.21+ with Echo framework and gorilla/websocket
+- **Database**: PostgreSQL 13+ with SQLC for type-safe queries
+- **Authentication**: JWT tokens with bcrypt password hashing
+- **Security**: CSRF protection, rate limiting, input validation
+- **Testing**: Comprehensive test suite with race detection
 
 
 
@@ -120,24 +115,6 @@ This project implements comprehensive concurrent safety measures:
 - **WebSocket (coder/websocket)** - Real-time communication protocol
 - **sync** - Concurrent programming primitives
 
-### Frontend
-- **HTML5** - Structure
-- **CSS3** - Styling
-- **JavaScript (ES6+)** - Client-side logic
-- **WebSocket API** - Browser WebSocket support
-
-### Testing
-- **testing** - Go's built-in testing framework
-- **testify** - Assertion library
-- **race detector** - Race condition detection
-
-## 📊 Performance
-
-- **Concurrent Connections** - Supports hundreds of concurrent WebSocket connections
-- **Low Latency** - Sub-millisecond message delivery
-- **Efficient Broadcasting** - Channel-based message distribution
-- **Memory Efficient** - Minimal memory footprint per connection
-
 ## 🚧 Roadmap
 
 ### Phase 1: Core Features ✅
@@ -149,8 +126,8 @@ This project implements comprehensive concurrent safety measures:
 - [x] Comprehensive testing
 
 ### Phase 2: Authentication & Persistence
-- [ ] JWT authentication
-- [ ] PostgreSQL integration
+- [X]JWT authentication
+- [X] PostgreSQL integration
 - [ ] Redis for session management
 - [ ] Message persistence
 - [ ] User profiles
@@ -171,10 +148,3 @@ This project implements comprehensive concurrent safety measures:
 - GitHub: [@Aliexe-code](https://github.com/Aliexe-code)
 - LinkedIn: [LinkedIn Profile](https://www.linkedin.com/in/ali-mohammed-4685ba318/)
 
-## 🙏 Acknowledgments
-
-- [Echo Framework](https://echo.labstack.com/) - High-performance HTTP framework
-- [WebSocket Library](https://github.com/coder/websocket) - WebSocket implementation
-- [Go Community](https://golang.org/) - Excellent documentation and community support
-
-**Built with ❤️ using Go and WebSockets**
