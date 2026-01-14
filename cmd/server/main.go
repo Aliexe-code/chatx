@@ -7,18 +7,38 @@ import (
 	"os/signal"
 	"syscall"
 
+	"websocket-demo/internal/db"
 	"websocket-demo/internal/hub"
+	"websocket-demo/internal/repository"
 	"websocket-demo/internal/server"
+
+	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
 func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	hub := hub.NewHub(ctx)
+	// Initialize database connection
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		log.Fatal("DATABASE_URL environment variable is required")
+	}
+
+	pool, err := db.NewPool(ctx, dbURL)
+	if err != nil {
+		log.Fatalf("Failed to connect to database: %v", err)
+	}
+	defer pool.Close()
+
+	queries := db.New(pool)
+	repo := repository.NewRepository(queries)
+
+	hub := hub.NewHub(ctx, repo)
+	hub.LoadRoomsFromDB()
 	go hub.Run()
 
-	srv := server.NewServer(hub)
+	srv := server.NewServer(hub, repo)
 	srv.SetupRoutes()
 
 	go func() {
