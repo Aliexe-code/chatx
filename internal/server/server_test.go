@@ -3,24 +3,73 @@ package server
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"sync"
 	"testing"
 	"time"
 
+	"websocket-demo/internal/auth"
 	"websocket-demo/internal/hub"
 
 	"github.com/coder/websocket"
+	"github.com/labstack/echo/v4"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
+// generateTestJWT creates a JWT token for testing
+func generateTestJWT(t *testing.T) string {
+	jwtService, err := auth.NewJWTService("test-secret-key-that-is-at-least-32-characters-long", "24h")
+	require.NoError(t, err)
+
+	token, err := jwtService.GenerateToken("test-user-id", "testuser")
+	require.NoError(t, err)
+	return token
+}
+
+// newTestServer creates a server instance for testing with consistent JWT secret
+func newTestServer(h *hub.Hub) *Server {
+	e := echo.New()
+
+	// Use the same test JWT secret as in generateTestJWT
+	jwtService, _ := auth.NewJWTService("test-secret-key-that-is-at-least-32-characters-long", "24h")
+
+	return &Server{
+		hub:        h,
+		echo:       e,
+		csrf:       NewCSRFProtection(),
+		repo:       nil,
+		jwtService: jwtService,
+	}
+}
+
+// createWebSocketConnection creates a WebSocket connection with JWT authentication
+func createWebSocketConnection(t *testing.T, testServer *httptest.Server) *websocket.Conn {
+	u, _ := url.Parse(testServer.URL)
+	u.Scheme = "ws"
+	u.Path = "/ws"
+
+	// Create request with JWT token
+	req, _ := http.NewRequest("GET", u.String(), nil)
+	req.Header.Set("Authorization", "Bearer "+generateTestJWT(t))
+
+	// Convert HTTP request to WebSocket dial options
+	opts := &websocket.DialOptions{
+		HTTPHeader: req.Header,
+	}
+
+	conn, _, err := websocket.Dial(context.Background(), u.String(), opts)
+	require.NoError(t, err)
+	return conn
+}
+
 func TestNewServer(t *testing.T) {
 	ctx := context.Background()
-	hub := hub.NewHub(ctx)
+	hub := hub.NewHub(ctx, nil) // No repository needed for this test
 
-	server := NewServer(hub)
+	server := newTestServer(hub)
 
 	assert.NotNil(t, server)
 	assert.NotNil(t, server.echo)
@@ -29,8 +78,8 @@ func TestNewServer(t *testing.T) {
 
 func TestSetupRoutes(t *testing.T) {
 	ctx := context.Background()
-	hub := hub.NewHub(ctx)
-	server := NewServer(hub)
+	hub := hub.NewHub(ctx, nil)
+	server := newTestServer(hub)
 
 	server.SetupRoutes()
 
@@ -58,10 +107,10 @@ func TestServerStart(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	hub := hub.NewHub(ctx)
+	hub := hub.NewHub(ctx, nil)
 	go hub.Run()
 
-	server := NewServer(hub)
+	server := newTestServer(hub)
 	server.SetupRoutes()
 
 	// Start test server
@@ -69,12 +118,7 @@ func TestServerStart(t *testing.T) {
 	defer testServer.Close()
 
 	// Verify server is accessible by checking WebSocket route
-	u, _ := url.Parse(testServer.URL)
-	u.Scheme = "ws"
-	u.Path = "/ws"
-
-	conn, _, err := websocket.Dial(context.Background(), u.String(), nil)
-	require.NoError(t, err)
+	conn := createWebSocketConnection(t, testServer)
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
 	// Verify we can connect
@@ -85,10 +129,10 @@ func TestWebSocketConnection(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	hub := hub.NewHub(ctx)
+	hub := hub.NewHub(ctx, nil)
 	go hub.Run()
 
-	server := NewServer(hub)
+	server := newTestServer(hub)
 	server.SetupRoutes()
 
 	// Start test server
@@ -96,12 +140,7 @@ func TestWebSocketConnection(t *testing.T) {
 	defer testServer.Close()
 
 	// Connect via WebSocket
-	u, _ := url.Parse(testServer.URL)
-	u.Scheme = "ws"
-	u.Path = "/ws"
-
-	conn, _, err := websocket.Dial(context.Background(), u.String(), nil)
-	require.NoError(t, err)
+	conn := createWebSocketConnection(t, testServer)
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
 	// Verify we can read at least one message (welcome message)
@@ -117,10 +156,10 @@ func TestMultipleWebSocketConnections(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	hub := hub.NewHub(ctx)
+	hub := hub.NewHub(ctx, nil)
 	go hub.Run()
 
-	server := NewServer(hub)
+	server := newTestServer(hub)
 	server.SetupRoutes()
 
 	// Start test server
@@ -132,20 +171,15 @@ func TestMultipleWebSocketConnections(t *testing.T) {
 	var wg sync.WaitGroup
 	connections := make([]*websocket.Conn, numClients)
 
-	u, _ := url.Parse(testServer.URL)
-	u.Scheme = "ws"
-	u.Path = "/ws"
-
 	for i := 0; i < numClients; i++ {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			conn, _, err := websocket.Dial(context.Background(), u.String(), nil)
-			require.NoError(t, err)
+			conn := createWebSocketConnection(t, testServer)
 			connections[id] = conn
 
 			// Read welcome message
-			_, _, err = conn.Read(context.Background())
+			_, _, err := conn.Read(context.Background())
 			assert.NoError(t, err)
 		}(i)
 	}
@@ -164,10 +198,10 @@ func TestWebSocketMessageSend(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	hub := hub.NewHub(ctx)
+	hub := hub.NewHub(ctx, nil)
 	go hub.Run()
 
-	server := NewServer(hub)
+	server := newTestServer(hub)
 	server.SetupRoutes()
 
 	// Start test server
@@ -175,16 +209,11 @@ func TestWebSocketMessageSend(t *testing.T) {
 	defer testServer.Close()
 
 	// Connect via WebSocket
-	u, _ := url.Parse(testServer.URL)
-	u.Scheme = "ws"
-	u.Path = "/ws"
-
-	conn, _, err := websocket.Dial(context.Background(), u.String(), nil)
-	require.NoError(t, err)
+	conn := createWebSocketConnection(t, testServer)
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
 	// Read welcome message
-	_, _, err = conn.Read(context.Background())
+	_, _, err := conn.Read(context.Background())
 	require.NoError(t, err)
 
 	// Send a chat message
@@ -200,10 +229,10 @@ func TestWebSocketRoomOperations(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	hub := hub.NewHub(ctx)
+	hub := hub.NewHub(ctx, nil)
 	go hub.Run()
 
-	server := NewServer(hub)
+	server := newTestServer(hub)
 	server.SetupRoutes()
 
 	// Start test server
@@ -211,23 +240,18 @@ func TestWebSocketRoomOperations(t *testing.T) {
 	defer testServer.Close()
 
 	// Connect via WebSocket
-	u, _ := url.Parse(testServer.URL)
-	u.Scheme = "ws"
-	u.Path = "/ws"
-
-	conn, _, err := websocket.Dial(context.Background(), u.String(), nil)
-	require.NoError(t, err)
+	conn := createWebSocketConnection(t, testServer)
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
 	// Read welcome message and join notification
 	for i := 0; i < 2; i++ {
-		_, _, err = conn.Read(context.Background())
+		_, _, err := conn.Read(context.Background())
 		require.NoError(t, err)
 	}
 
 	// Create a room
 	createRoomMsg := `{"type":"create_room","data":{"name":"test-room","private":false,"password":""}}`
-	err = conn.Write(context.Background(), websocket.MessageText, []byte(createRoomMsg))
+	err := conn.Write(context.Background(), websocket.MessageText, []byte(createRoomMsg))
 	require.NoError(t, err)
 
 	time.Sleep(100 * time.Millisecond)
@@ -277,19 +301,15 @@ func TestWebSocketConnectionRaceConditions(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	hub := hub.NewHub(ctx)
+	hub := hub.NewHub(ctx, nil)
 	go hub.Run()
 
-	server := NewServer(hub)
+	server := newTestServer(hub)
 	server.SetupRoutes()
 
 	// Start test server
 	testServer := httptest.NewServer(server.echo)
 	defer testServer.Close()
-
-	u, _ := url.Parse(testServer.URL)
-	u.Scheme = "ws"
-	u.Path = "/ws"
 
 	var wg sync.WaitGroup
 	const numConnections = 20
@@ -299,8 +319,8 @@ func TestWebSocketConnectionRaceConditions(t *testing.T) {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			conn, _, err := websocket.Dial(ctx, u.String(), nil)
-			if err != nil {
+			conn := createWebSocketConnection(t, testServer)
+			if conn == nil {
 				return
 			}
 
@@ -321,25 +341,21 @@ func TestWebSocketConnectionRaceConditions(t *testing.T) {
 func TestServerGracefulShutdown(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 
-	hub := hub.NewHub(ctx)
+	hub := hub.NewHub(ctx, nil)
 	go hub.Run()
 
-	server := NewServer(hub)
+	server := newTestServer(hub)
 	server.SetupRoutes()
 
 	// Start test server
 	testServer := httptest.NewServer(server.echo)
 
 	// Connect a client
-	u, _ := url.Parse(testServer.URL)
-	u.Scheme = "ws"
-	u.Path = "/ws"
-
-	conn, _, err := websocket.Dial(context.Background(), u.String(), nil)
-	require.NoError(t, err)
+	conn := createWebSocketConnection(t, testServer)
+	require.NotNil(t, conn)
 
 	// Read welcome message
-	_, _, err = conn.Read(context.Background())
+	_, _, err := conn.Read(context.Background())
 	require.NoError(t, err)
 
 	// Trigger graceful shutdown
@@ -362,19 +378,15 @@ func TestConcurrentServerOperations(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	hub := hub.NewHub(ctx)
+	hub := hub.NewHub(ctx, nil)
 	go hub.Run()
 
-	server := NewServer(hub)
+	server := newTestServer(hub)
 	server.SetupRoutes()
 
 	// Start test server
 	testServer := httptest.NewServer(server.echo)
 	defer testServer.Close()
-
-	u, _ := url.Parse(testServer.URL)
-	u.Scheme = "ws"
-	u.Path = "/ws"
 
 	var wg sync.WaitGroup
 	const numGoroutines = 30
@@ -384,8 +396,8 @@ func TestConcurrentServerOperations(t *testing.T) {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			conn, _, err := websocket.Dial(ctx, u.String(), nil)
-			if err != nil {
+			conn := createWebSocketConnection(t, testServer)
+			if conn == nil {
 				return
 			}
 			defer conn.Close(websocket.StatusNormalClosure, "")
