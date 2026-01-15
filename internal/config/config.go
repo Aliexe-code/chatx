@@ -14,6 +14,8 @@ type Config struct {
 	JWTSecret   string
 	JWTExpiry   string
 	TestMode    bool
+	NATSURL     string
+	NATSEnable  bool
 }
 
 // Load loads configuration from environment variables
@@ -31,6 +33,8 @@ func Load() (*Config, error) {
 		JWTSecret:   getEnv("JWT_SECRET", ""),
 		JWTExpiry:   getEnv("JWT_EXPIRATION", "24h"),
 		TestMode:    getEnv("TEST_MODE", "false") == "true",
+		NATSURL:     getEnv("NATS_URL", "nats://localhost:4222"),
+		NATSEnable:  getEnv("NATS_ENABLE", "true") == "true",
 	}
 
 	// Validate required fields

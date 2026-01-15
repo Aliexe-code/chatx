@@ -11,7 +11,8 @@ import (
 
 	"golang.org/x/crypto/bcrypt"
 
-	"websocket-demo/internal/client"
+	clientpkg "websocket-demo/internal/client"
+	natsclient "websocket-demo/internal/nats"
 	"websocket-demo/internal/repository"
 	"websocket-demo/internal/room"
 	"websocket-demo/internal/types"
@@ -20,36 +21,42 @@ import (
 	"github.com/coder/websocket"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/nats-io/nats.go"
 )
 
 // Hub manages all WebSocket connections and broadcasts messages between clients
 // Uses the Hub pattern for efficient client management
 type Hub struct {
-	Clients     map[*client.Client]bool
+	Clients     map[*clientpkg.Client]bool
 	Rooms       map[string]*room.Room
-	ClientRooms map[*client.Client]*room.Room
+	ClientRooms map[*clientpkg.Client]*room.Room
 	Broadcast   chan types.Message
-	Register    chan *client.Client
-	Unregister  chan *client.Client
+	Register    chan *clientpkg.Client
+	Unregister  chan *clientpkg.Client
 	Repo        *repository.Repository
 	Mutex       sync.RWMutex
 	Ctx         context.Context
 	UserCount   int
 	roomOpMutex sync.Mutex // Prevents concurrent room operations on the same client
+	NATS        *natsclient.Client
+	NATSEnabled bool
 }
 
 // NewHub creates and initializes a new Hub instance
-func NewHub(ctx context.Context, repo *repository.Repository) *Hub {
+func NewHub(ctx context.Context, repo *repository.Repository, natsClient *natsclient.Client) *Hub {
+	natsEnabled := natsClient != nil && natsClient.IsConnected()
 	return &Hub{
-		Clients:     make(map[*client.Client]bool),
+		Clients:     make(map[*clientpkg.Client]bool),
 		Rooms:       make(map[string]*room.Room),
-		ClientRooms: make(map[*client.Client]*room.Room),
+		ClientRooms: make(map[*clientpkg.Client]*room.Room),
 		Broadcast:   make(chan types.Message, 100),  // Buffered channel to avoid blocking
-		Register:    make(chan *client.Client, 100), // Buffered to prevent deadlocks
-		Unregister:  make(chan *client.Client, 100), // Buffered to prevent deadlocks
+		Register:    make(chan *clientpkg.Client, 100), // Buffered to prevent deadlocks
+		Unregister:  make(chan *clientpkg.Client, 100), // Buffered to prevent deadlocks
 		Repo:        repo,
 		Ctx:         ctx,
 		UserCount:   0,
+		NATS:        natsClient,
+		NATSEnabled: natsEnabled,
 	}
 }
 
@@ -114,11 +121,33 @@ func (h *Hub) CreateRoom(name string, private bool, password string, maxClients 
 		}
 	}
 
+	// Publish room creation to NATS for synchronization across servers
+	if h.NATSEnabled && h.NATS != nil {
+		roomData := map[string]interface{}{
+			"name":     name,
+			"private":  private,
+			"password": password,
+			"maxClients": maxClients,
+		}
+		roomDataJSON, _ := json.Marshal(roomData)
+
+		syncMsg := types.Message{
+			Content: roomDataJSON,
+			Type:    types.MsgTypeRoomSync,
+		}
+
+		if err := h.NATS.Publish(natsclient.SubjectRoomSync, syncMsg); err != nil {
+			log.Printf("Failed to publish room sync to NATS: %v", err)
+		} else {
+			log.Printf("Published room sync to NATS: %s", name)
+		}
+	}
+
 	return newRoom, nil
 }
 
 // JoinRoom adds a client to a room
-func (h *Hub) JoinRoom(client *client.Client, targetRoom *room.Room, password string) error {
+func (h *Hub) JoinRoom(client *clientpkg.Client, targetRoom *room.Room, password string) error {
 	// Acquire locks in consistent order: h.Mutex first, then roomOpMutex
 	h.Mutex.Lock()
 	h.roomOpMutex.Lock()
@@ -181,10 +210,35 @@ func (h *Hub) JoinRoom(client *client.Client, targetRoom *room.Room, password st
 	h.roomOpMutex.Unlock()
 	h.Mutex.Unlock()
 
+	// Subscribe to room-specific NATS subject if enabled
+	if h.NATSEnabled && h.NATS != nil {
+		subject := natsclient.RoomSubject(targetRoom.Name)
+		// Use regular subscription (not queue) so ALL servers receive every message
+		// Queue subscriptions are for load balancing (one consumer gets the message),
+		// but we need pub/sub (all consumers get the message) for cross-server distribution
+		_, err := h.NATS.Subscribe(subject, func(msg types.Message) {
+			// Skip messages that originated from this server to prevent duplicate delivery
+			if msg.ServerID != "" && msg.ServerID == h.NATS.GetServerID() {
+				log.Printf("Skipping message from own server %s", msg.ServerID)
+				return
+			}
+			// Forward NATS messages to BroadcastToRoom for consistent handling
+			// BroadcastToRoom will handle delivery to local clients
+			h.BroadcastToRoom(targetRoom, msg)
+		})
+		if err != nil {
+			log.Printf("Failed to subscribe to room NATS subject %s: %v", subject, err)
+		} else {
+			log.Printf("Subscribed to room NATS subject: %s", subject)
+		}
+	}
+
 	// Broadcast room join notification
 	timestamp := time.Now().Format("15:04:05")
 	joinMsg := []byte(fmt.Sprintf("[%s] %s has joined the room", timestamp, client.Name))
-	h.BroadcastToRoom(targetRoom, types.Message{Content: joinMsg, Sender: client, Type: types.MsgTypeRoomJoin})
+	// Add MessageID to prevent duplicate broadcasting via NATS
+	joinMessageID := fmt.Sprintf("join-%d-%s", time.Now().UnixNano(), client.UserID)
+	h.BroadcastToRoom(targetRoom, types.Message{MessageID: joinMessageID, Content: joinMsg, Sender: client, Type: types.MsgTypeRoomJoin})
 
 	// Send room welcome message
 	welcomeMsg := []byte(fmt.Sprintf("[%s] Welcome to room '%s'!", timestamp, targetRoom.Name))
@@ -196,7 +250,7 @@ func (h *Hub) JoinRoom(client *client.Client, targetRoom *room.Room, password st
 }
 
 // leaveRoomInternal removes a client from their current room (internal use, assumes h.Mutex and roomOpMutex are held)
-func (h *Hub) leaveRoomInternal(client *client.Client) {
+func (h *Hub) leaveRoomInternal(client *clientpkg.Client) {
 	currentRoom := client.GetCurrentRoom()
 	if currentRoom == nil {
 		return // Not in any room
@@ -245,7 +299,7 @@ func (h *Hub) leaveRoomInternal(client *client.Client) {
 }
 
 // LeaveRoom removes a client from their current room
-func (h *Hub) LeaveRoom(client *client.Client) {
+func (h *Hub) LeaveRoom(client *clientpkg.Client) {
 	// Acquire locks in consistent order: h.Mutex first, then roomOpMutex
 	h.Mutex.Lock()
 	h.roomOpMutex.Lock()
@@ -255,7 +309,7 @@ func (h *Hub) LeaveRoom(client *client.Client) {
 }
 
 // DeleteRoom deletes a room
-func (h *Hub) DeleteRoom(client *client.Client, roomName string) error {
+func (h *Hub) DeleteRoom(client *clientpkg.Client, roomName string) error {
 	h.Mutex.RLock()
 	targetRoom, exists := h.Rooms[roomName]
 	h.Mutex.RUnlock()
@@ -285,9 +339,20 @@ func (h *Hub) DeleteRoom(client *client.Client, roomName string) error {
 // BroadcastToRoom sends a message to all clients in a specific room
 func (h *Hub) BroadcastToRoom(targetRoom *room.Room, message types.Message) {
 	clients := targetRoom.GetClients()
-	log.Printf("BroadcastToRoom: Room '%s', Message type '%s', Total clients in room: %d", targetRoom.Name, message.Type, len(clients))
+	log.Printf("BroadcastToRoom: Room '%s', Message type '%s', MessageID: '%s', Total clients in room: %d", targetRoom.Name, message.Type, message.MessageID, len(clients))
 
-	clientsToRemove := make([]*client.Client, 0)
+	// Skip publishing to NATS if this message already has a MessageID (meaning it came from NATS)
+	// This prevents the infinite loop: NATS → BroadcastToRoom → NATS → BroadcastToRoom → ...
+	if h.NATSEnabled && h.NATS != nil && message.MessageID == "" {
+		subject := natsclient.RoomSubject(targetRoom.Name)
+		if err := h.NATS.Publish(subject, message); err != nil {
+			log.Printf("Failed to publish message to NATS subject %s: %v", subject, err)
+		} else {
+			log.Printf("Published message to NATS subject %s", subject)
+		}
+	}
+
+	clientsToRemove := make([]*clientpkg.Client, 0)
 	// Send to all clients in room
 	for _, client := range clients {
 		if client.Conn == nil {
@@ -340,6 +405,80 @@ func (h *Hub) VerifyPassword(inputPassword, correctPassword string) bool {
 // This is the core of the Hub pattern implementation
 func (h *Hub) Run() {
 	log.Println("Hub Run() function started")
+
+	// Set up NATS subscriptions if enabled
+	var globalChatSub *nats.Subscription
+	var roomSyncSub *nats.Subscription
+	if h.NATSEnabled && h.NATS != nil {
+		// Subscribe to global chat
+		sub, err := h.NATS.Subscribe(natsclient.SubjectGlobalChat, func(msg types.Message) {
+			// Skip messages that originated from this server
+			if msg.ServerID != "" && msg.ServerID == h.NATS.GetServerID() {
+				log.Printf("Skipping global message from own server %s", msg.ServerID)
+				return
+			}
+			// Only process messages from other servers
+			h.Broadcast <- msg
+		})
+		if err != nil {
+			log.Printf("Failed to subscribe to global chat: %v", err)
+		} else {
+			globalChatSub = sub
+			log.Println("Subscribed to NATS global chat subject")
+		}
+
+		// Subscribe to room sync for cross-server room creation
+		roomSyncSub, err = h.NATS.Subscribe(natsclient.SubjectRoomSync, func(msg types.Message) {
+			// Parse room data
+			var roomData map[string]interface{}
+			if err := json.Unmarshal(msg.Content, &roomData); err != nil {
+				log.Printf("Failed to unmarshal room sync data: %v", err)
+				return
+			}
+
+			name, _ := roomData["name"].(string)
+			private, _ := roomData["private"].(bool)
+			password, _ := roomData["password"].(string)
+			maxClients := 100
+			if mc, ok := roomData["maxClients"].(float64); ok {
+				maxClients = int(mc)
+			}
+
+			// Check if room already exists
+			h.Mutex.Lock()
+			if _, exists := h.Rooms[name]; !exists {
+				// Create room from sync data
+				newRoom := room.NewRoom(name, private, password, maxClients)
+				h.Rooms[name] = newRoom
+				log.Printf("Room %s synced from NATS", name)
+
+				// Try to load from database to get ID
+				if h.Repo != nil {
+					ctx := context.Background()
+					dbRoom, err := h.Repo.GetRoomByName(ctx, name)
+					if err == nil {
+						newRoom.ID = uuid.UUID(dbRoom.ID.Bytes).String()
+					}
+				}
+			}
+			h.Mutex.Unlock()
+		})
+		if err != nil {
+			log.Printf("Failed to subscribe to room sync: %v", err)
+		} else {
+			log.Println("Subscribed to NATS room sync subject")
+		}
+	}
+
+	defer func() {
+		if globalChatSub != nil {
+			globalChatSub.Unsubscribe()
+		}
+		if roomSyncSub != nil {
+			roomSyncSub.Unsubscribe()
+		}
+	}()
+
 	for {
 		select {
 		case <-h.Ctx.Done():
@@ -350,8 +489,11 @@ func (h *Hub) Run() {
 					client.Conn.Close(websocket.StatusNormalClosure, "server shutting down")
 				}
 			}
-			h.Clients = make(map[*client.Client]bool)
+			h.Clients = make(map[*clientpkg.Client]bool)
 			h.Mutex.Unlock()
+			if h.NATS != nil {
+				h.NATS.Close()
+			}
 			return
 
 		case client := <-h.Register:
@@ -393,7 +535,7 @@ func (h *Hub) Run() {
 		case message := <-h.Broadcast:
 			// Save chat messages to database
 			if (message.Type == types.MsgTypeChat || message.Type == types.MsgTypeRoomMessage) && message.Sender != nil {
-				if sender, ok := message.Sender.(*client.Client); ok && sender.Authenticated && sender.UserID != "" {
+				if sender, ok := message.Sender.(*clientpkg.Client); ok && sender.Authenticated && sender.UserID != "" {
 					// Parse the message content to get chat content
 					var chatMsg types.ChatMessage
 					if err := json.Unmarshal(message.Content, &chatMsg); err == nil {
@@ -413,6 +555,13 @@ func (h *Hub) Run() {
 				}
 			}
 
+			// Publish to NATS for global messages if enabled and message doesn't have a MessageID
+			if h.NATSEnabled && h.NATS != nil && message.Room == nil && message.MessageID == "" {
+				if err := h.NATS.Publish(natsclient.SubjectGlobalChat, message); err != nil {
+					log.Printf("Failed to publish global message to NATS: %v", err)
+				}
+			}
+
 			// Handle room-specific broadcasts
 			if message.Room != nil {
 				// Type assertion
@@ -423,7 +572,7 @@ func (h *Hub) Run() {
 				h.Mutex.RLock()
 				log.Printf("Broadcasting message of type '%s' to %d clients", message.Type, len(h.Clients))
 				sentCount := 0
-				clientsToRemove := make([]*client.Client, 0)
+				clientsToRemove := make([]*clientpkg.Client, 0)
 
 				for client := range h.Clients {
 					// Don't send the message back to the sender (for chat messages)
@@ -479,7 +628,7 @@ func (h *Hub) GetRoom(name string) (*room.Room, bool) {
 }
 
 // GetRoomList returns a list of all rooms with their information
-func (h *Hub) GetRoomList(client *client.Client) []types.RoomDTO {
+func (h *Hub) GetRoomList(client *clientpkg.Client) []types.RoomDTO {
 	h.Mutex.RLock()
 	rooms := make(map[string]*room.Room)
 	for name, r := range h.Rooms {

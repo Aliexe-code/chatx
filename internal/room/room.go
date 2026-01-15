@@ -86,3 +86,8 @@ func (r *Room) SetCreator(client *client.Client) {
 	defer r.Mutex.Unlock()
 	r.Creator = client
 }
+
+// GetName returns the name of the room
+func (r *Room) GetName() string {
+	return r.Name
+}

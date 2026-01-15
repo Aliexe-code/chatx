@@ -6,10 +6,12 @@ import (
 
 // Message represents a message to be broadcast to all clients
 type Message struct {
+	MessageID string      // Unique ID to prevent NATS re-broadcasting loops
 	Content   []byte
 	Sender    interface{} // Can be *client.Client
 	Type      string      // "chat", "join", "leave"
 	Room      interface{} // Can be *room.Room
+	ServerID  string      // ID of the server that sent the message (for NATS)
 	Timestamp time.Time
 }
 
@@ -57,4 +59,5 @@ const (
 	MsgTypeRoomMessage = "room_message"
 	MsgTypeDeleteRoom  = "delete_room"
 	MsgTypeGetMessages = "get_messages"
+	MsgTypeRoomSync    = "room_sync"  // Room synchronization across servers
 )

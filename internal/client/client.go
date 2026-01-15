@@ -40,3 +40,13 @@ func (c *Client) SetCurrentRoom(room interface{}) {
 	defer c.RoomMutex.Unlock()
 	c.CurrentRoom = room
 }
+
+// GetID returns the user ID of the client
+func (c *Client) GetID() string {
+	return c.UserID
+}
+
+// GetName returns the name of the client
+func (c *Client) GetName() string {
+	return c.Name
+}

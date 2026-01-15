@@ -8,7 +8,7 @@ import (
 
 func TestCreateAndListRoom(t *testing.T) {
 	// Create a hub without repo (in-memory only)
-	h := NewHub(context.Background(), nil)
+	h := NewHub(context.Background(), nil, nil)
 
 	// Create a room
 	_, err := h.CreateRoom("TestRoom", false, "", 10)

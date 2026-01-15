@@ -6,9 +6,12 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
+	"websocket-demo/internal/config"
 	"websocket-demo/internal/db"
 	"websocket-demo/internal/hub"
+	"websocket-demo/internal/nats"
 	"websocket-demo/internal/repository"
 	"websocket-demo/internal/server"
 
@@ -18,6 +21,12 @@ import (
 func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Load configuration
+	cfg, err := config.Load()
+	if err != nil {
+		log.Fatalf("Failed to load configuration: %v", err)
+	}
 
 	// Initialize database connection
 	dbURL := os.Getenv("DATABASE_URL")
@@ -34,7 +43,41 @@ func main() {
 	queries := db.New(pool)
 	repo := repository.NewRepository(queries)
 
-	hub := hub.NewHub(ctx, repo)
+	// Initialize NATS client if enabled
+	var natsClient *nats.Client
+	if cfg.NATSEnable {
+		// Retry NATS connection with backoff to handle startup timing
+		maxRetries := 5
+		retryDelay := 2 * time.Second
+
+		for i := 0; i < maxRetries; i++ {
+			natsCfg := nats.Config{
+				URL:            cfg.NATSURL,
+				MaxReconnects:  10,
+				ReconnectWait:  2 * time.Second,
+				Timeout:        10 * time.Second,
+				EnableJetStream: false,
+			}
+			natsClient, err = nats.NewClient(natsCfg)
+			if err == nil {
+				log.Println("Successfully connected to NATS")
+				break
+			}
+
+			if i < maxRetries-1 {
+				log.Printf("Failed to connect to NATS (attempt %d/%d): %v, retrying in %v...", i+1, maxRetries, err, retryDelay)
+				time.Sleep(retryDelay)
+			}
+		}
+
+		if err != nil {
+			log.Printf("Failed to connect to NATS after %d attempts: %v", maxRetries, err)
+			log.Println("Continuing without NATS support")
+			natsClient = nil
+		}
+	}
+
+	hub := hub.NewHub(ctx, repo, natsClient)
 	hub.LoadRoomsFromDB()
 	go hub.Run()
 
@@ -42,7 +85,8 @@ func main() {
 	srv.SetupRoutes()
 
 	go func() {
-		if err := srv.Start(":8080"); err != nil {
+		addr := ":" + cfg.ServerPort
+		if err := srv.Start(addr); err != nil {
 			log.Fatalf("Server failed to start: %v", err)
 		}
 	}()

@@ -17,7 +17,7 @@ import (
 
 func TestNewHub(t *testing.T) {
 	ctx := context.Background()
-	hub := NewHub(ctx, nil)
+	hub := NewHub(ctx, nil, nil)
 
 	assert.NotNil(t, hub)
 	assert.Empty(t, hub.Clients)
@@ -25,13 +25,14 @@ func TestNewHub(t *testing.T) {
 	assert.NotNil(t, hub.Register)
 	assert.NotNil(t, hub.Unregister)
 	assert.Equal(t, ctx, hub.Ctx)
+	assert.False(t, hub.NATSEnabled)
 }
 
 func TestHubRun(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	hub := NewHub(ctx, nil)
+	hub := NewHub(ctx, nil, nil)
 	go hub.Run()
 
 	select {
@@ -65,7 +66,7 @@ func TestRaceConditions(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	hub := NewHub(ctx, nil)
+	hub := NewHub(ctx, nil, nil)
 	go hub.Run()
 
 	var wg sync.WaitGroup
@@ -127,7 +128,7 @@ func TestHighConcurrencyStress(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	hub := NewHub(ctx, nil)
+	hub := NewHub(ctx, nil, nil)
 	go hub.Run()
 
 	var wg sync.WaitGroup
@@ -184,7 +185,7 @@ func TestHighConcurrencyStress(t *testing.T) {
 func TestHubShutdown(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 
-	hub := NewHub(ctx, nil)
+	hub := NewHub(ctx, nil, nil)
 	go hub.Run()
 
 	// Register some clients
@@ -217,7 +218,7 @@ func TestConcurrentMapAccess(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	hub := NewHub(ctx, nil)
+	hub := NewHub(ctx, nil, nil)
 	go hub.Run()
 
 	var wg sync.WaitGroup
@@ -251,7 +252,7 @@ func TestCreateRoom(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	hub := NewHub(ctx, nil)
+	hub := NewHub(ctx, nil, nil)
 	go hub.Run()
 
 	// Test creating a valid room
@@ -276,7 +277,7 @@ func TestJoinRoom(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	hub := NewHub(ctx, nil)
+	hub := NewHub(ctx, nil, nil)
 	go hub.Run()
 
 	// Create a test room
@@ -303,7 +304,7 @@ func TestBroadcastToRoom(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	hub := NewHub(ctx, nil)
+	hub := NewHub(ctx, nil, nil)
 	go hub.Run()
 
 	// Create a test room
